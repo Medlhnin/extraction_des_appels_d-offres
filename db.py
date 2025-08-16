@@ -1,20 +1,22 @@
+# db.py
 from __future__ import annotations
 
 import traceback
+from datetime import datetime
 import pandas as pd
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
+import numpy as np
+
 
 # ----------------------------------------------------------------------
-# 1. Configuration connexion
-#    ➜ adaptez le mot de passe, l’hôte, le port et la base si nécessaire
+# 1) Connexion
 # ----------------------------------------------------------------------
 DB_URL = "postgresql://postgres:your_password@localhost:5432/AppelOffre"
 engine = create_engine(DB_URL, future=True, pool_pre_ping=True)
 
 # ----------------------------------------------------------------------
-# 2. Correspondance DataFrame ➜ colonnes SQL
-#    (ajoutez / modifiez si le scraping évolue)
+# 2) Mapping colonnes DataFrame -> Base
 # ----------------------------------------------------------------------
 COL_MAP = {
     "Organisme": "organisme",
@@ -27,14 +29,43 @@ COL_MAP = {
     "Caution": "caution",
     "Estimation": "estimation",
     "Description": "description",
-    "Marché": "marche",           # ajouté depuis la logique Streamlit
+    "Marché": "marche",
 }
 
 # ----------------------------------------------------------------------
-# 3. Outils
+# 3) Création des tables si elles n'existent pas
+# ----------------------------------------------------------------------
+def ensure_tables():
+    with engine.begin() as conn:
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS appels_offres (
+            id BIGSERIAL PRIMARY KEY,
+            organisme     TEXT,
+            date_poste    TIMESTAMP,
+            type_offre    TEXT,
+            ville         TEXT,
+            numero_ordre  TEXT,
+            numero_ao     TEXT,
+            date_limite   TIMESTAMP,
+            caution       NUMERIC,
+            estimation    NUMERIC,
+            description   TEXT,
+            marche        TEXT,
+            UNIQUE (numero_ordre, date_poste)
+        );
+        """))
+
+        conn.execute(text("""
+        CREATE TABLE IF NOT EXISTS scraping_metadata (
+            id SERIAL PRIMARY KEY,
+            last_scraping TIMESTAMP NOT NULL
+        );
+        """))
+
+# ----------------------------------------------------------------------
+# 4) Utils
 # ----------------------------------------------------------------------
 def force_utf8(value):
-    """Tente de convertir énigmatiques encodages latin‑1 en UTF‑8, sinon renvoie intact."""
     if isinstance(value, str):
         try:
             return value.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
@@ -42,68 +73,106 @@ def force_utf8(value):
             return value
     return value
 
+def _to_datetime_series(s: pd.Series, dayfirst: bool = True):
+    return pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
 
 # ----------------------------------------------------------------------
-# 4. Fonction principale : save_and_mark_new
+# 5) Lecture / écriture de la date de dernier scraping
+# ----------------------------------------------------------------------
+def get_last_scraping_date():
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT last_scraping FROM scraping_metadata ORDER BY id DESC LIMIT 1")
+        ).fetchone()
+        return row[0] if row else None
+
+def update_last_scraping_meta_data(num_new_ao: int):
+    ts = datetime.now()
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO scraping_metadata (last_scraping, new_ao_count) VALUES (:ts, :num_new_ao)"),
+            {"ts": ts, "num_new_ao": num_new_ao}
+        )
+
+# ----------------------------------------------------------------------
+# 6) Save + marquage is_new (en mémoire uniquement)
 # ----------------------------------------------------------------------
 def save_and_mark_new(df: pd.DataFrame, table_name: str = "appels_offres") -> pd.DataFrame:
     """
-    Enregistre les AO dans `table_name`.
-    • Ajoute/renomme les colonnes pour correspondre aux champs SQL.
-    • Déduplique sur (numero_ordre, date_poste) : si déjà présent → is_new = FALSE.
-    Retourne un DataFrame des entrées effectivement insérées comme « nouvelles ».
+    - Renomme les colonnes selon COL_MAP
+    - Convertit les dates
+    - Calcule is_new = date_poste > last_scraping_date (en mémoire, pas en base)
+    - Insère en base avec ON CONFLICT (numero_ordre, date_poste)
+    - Retourne uniquement les lignes is_new=True
     """
-    # -- 4‑1. Harmonisation des colonnes
+    ensure_tables()
+
+    # Harmoniser les colonnes
     df = df.rename(columns=COL_MAP)
 
+    # S'assurer que toutes les colonnes existent
     for col in COL_MAP.values():
         if col not in df.columns:
             df[col] = None
 
-    # Valeur par défaut pour 'marche'
-    df["marche"] = df.get("marche").fillna("Non spécifié")
+    # Convertir dates
+    df["date_poste"] = _to_datetime_series(df["date_poste"], dayfirst=True)
+    if "date_limite" in df.columns:
+        df["date_limite"] = _to_datetime_series(df["date_limite"], dayfirst=True)
 
-    # -- 4‑2. Connexion
-    conn = engine.connect()
-    new_entries = []
+    # Valeurs numériques
+    for num_col in ["caution", "estimation"]:
+        if num_col in df.columns:
+            df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
 
-    for idx, row in df.iterrows():
-        try:
-            # Nettoyage encodage
-            data = {k: force_utf8(v) for k, v in row.to_dict().items()}
-            data["is_new"] = True
+    # Valeur par défaut 'marche'
+    if "marche" in df.columns:
+        df["marche"] = df["marche"].fillna("Non spécifié")
 
-            insert_stmt = text(f"""
-                INSERT INTO {table_name} (
-                    organisme, date_poste, type_offre, ville, numero_ordre,
-                    numero_ao, date_limite, caution, estimation, description,
-                    marche, is_new
-                )
-                VALUES (
-                    :organisme, :date_poste, :type_offre, :ville, :numero_ordre,
-                    :numero_ao, :date_limite, :caution, :estimation, :description,
-                    :marche, :is_new
-                )
-                ON CONFLICT (numero_ordre, date_poste)
-                DO UPDATE SET is_new = FALSE
-                RETURNING *;
-            """)
+    # Calcul de is_new par rapport à la dernière date de scraping
+    last_scraping_date = get_last_scraping_date()
+    if last_scraping_date is None:
+        df["is_new"] = True
+    else:
+        df["is_new"] = df["date_poste"] > last_scraping_date
 
-            result = conn.execute(insert_stmt, data)
-            new_entries.append(dict(result.fetchone()))
+    df = df.replace({pd.NaT: None, np.nan: None})
+    # SQL d'insertion (sans RETURNING is_new)
+    insert_sql = f"""
+        INSERT INTO {table_name} (
+            organisme, date_poste, type_offre, ville, numero_ordre,
+            numero_ao, date_limite, caution, estimation, description,
+            marche
+        )
+        VALUES (
+            :organisme, :date_poste, :type_offre, :ville, :numero_ordre,
+            :numero_ao, :date_limite, :caution, :estimation, :description,
+            :marche
+        )
+        ON CONFLICT (numero_ordre, date_poste)
+        DO UPDATE SET
+            organisme   = EXCLUDED.organisme,
+            type_offre  = EXCLUDED.type_offre,
+            ville       = EXCLUDED.ville,
+            numero_ao   = EXCLUDED.numero_ao,
+            date_limite = EXCLUDED.date_limite,
+            caution     = EXCLUDED.caution,
+            estimation  = EXCLUDED.estimation,
+            description = EXCLUDED.description,
+            marche      = EXCLUDED.marche;
+    """
 
-        except IntegrityError:  # autre conflit de clé unique
-            conn.rollback()
-            continue
+    # Insertion ligne par ligne
+    try:
+        with engine.begin() as conn:
+            for _, row in df.iterrows():
+                data = {k: force_utf8(v) for k, v in row.to_dict().items() if k in COL_MAP.values()}
+                conn.execute(text(insert_sql), data)
+    except IntegrityError as e:
+        print("\n⛔ IntegrityError:", e)
+        print(traceback.format_exc())
 
-        except Exception as e:
-            print(f"\n⛔ ERREUR FATALE à la ligne {idx} : {e}")
-            print(f"📌 Données brutes : {row.to_dict()}")
-            print(traceback.format_exc())
-            conn.rollback()
-            continue
+    inverse_map = {v: k for k, v in COL_MAP.items()}
+    df = df.rename(columns=inverse_map)
 
-    conn.commit()
-    conn.close()
-
-    return pd.DataFrame(new_entries)
+    return df

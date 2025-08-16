@@ -212,7 +212,7 @@ def extract_ao_details(ao):
 
 def extract_ao_attributes(ao):
     """Numéro ordre, n° AO, date limite, caution, estimation."""
-    num_ordre = "Non spécifié"  # ← valeur par défaut sécurisée
+    num_ordre = "Non spécifié"
     num_ao, date_limit, caution, estimation = ("Non spécifié",) * 4
 
     attributes_section = ao.find_all(

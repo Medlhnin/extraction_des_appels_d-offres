@@ -4,6 +4,9 @@ import io
 from datetime import datetime
 from Extract_data_from_sodipress import extract_aos
 from db import save_and_mark_new
+from db import update_last_scraping_meta_data
+from db import COL_MAP
+import psycopg2
 
 # Configuration de la page
 st.set_page_config(page_title="Gestion des Appels d'Offres", layout="wide")
@@ -28,7 +31,9 @@ st.markdown(
 # Sidebar pour la navigation
 st.sidebar.title("🔧 Configuration")
 st.sidebar.subheader("🔄 Workflow de Scraping")
-scraping_action = st.sidebar.selectbox("Action :", ["Lancer le Scraping", "Charger les Données Extraites"])
+scraping_action = st.sidebar.selectbox("Action :", ["Lancer le Scraping",
+                                                    "Charger les Données Extraites",
+                                                    "Automatisation"])
 
 # Contenu principal
 st.title("🚀 Gestion et Visualisation des Appels d'Offres")
@@ -42,17 +47,11 @@ if scraping_action == "Lancer le Scraping":
         with st.spinner("🔎 Extraction en cours... Veuillez patienter."):
             try:
                 df_extracted = extract_aos()
-                new_df = save_and_mark_new(df_extracted)
-                df_extracted["is_new"] = df_extracted.apply(
-                lambda row: any(
-                    (row["numero_ordre"] == new_row["numero_ordre"]) and
-                    (row["date_poste"] == new_row["date_poste"])
-                    for _, new_row in new_df.iterrows()
-                ), axis=1
-                )
-
+                df_extracted = save_and_mark_new(df_extracted)
+                num_new_ao = len(df_extracted[df_extracted['is_new'] == True])
                 st.session_state["ao_data"] = df_extracted
-                st.success(f"✅ {len(new_df)} nouveaux appels d'offres détectés et enregistrés.")
+                st.success(f"✅ {num_new_ao} nouveaux appels d'offres détectés et enregistrés.")
+                update_last_scraping_meta_data(num_new_ao)
             except Exception as e:
                 st.error(f"❌ Une erreur est survenue : {e}")
 
@@ -94,7 +93,7 @@ if "ao_data" in st.session_state:
         # Convertir Date Limite en format datetime et gérer les valeurs vides
         df['Date Limite'] = pd.to_datetime(df['Date Limite'], errors='coerce', dayfirst=True)
         df['Marché'] = df['Date Limite'].apply(lambda x: "🔴 Dépassé" if pd.isna(x) or x < datetime.now() else "🟢 En Cours")
-
+        df['is_new'] = df['is_new'].apply(lambda x : "🔔" if x == True else "🔕")
     # Visualisation
     st.subheader("2️⃣ Visualiser et Filtrer les Appels d'Offres")
 
@@ -110,13 +109,18 @@ if "ao_data" in st.session_state:
         if 'Ville' in df.columns:
             filter_ville = st.selectbox("🏙️ Filtrer par Ville", options=["Toutes"] + sorted(df['Ville'].dropna().unique().tolist()))
         else:
-            filter_ville = "Toutes"
-    
+            filter_ville = "Toutes"   
     with col4:
-        if 'Type d\'offre' in df.columns:
-            filter_type = st.selectbox("📌 Filtrer par Type d'offre", options=["Tous"] + sorted(df['Type d\'offre'].dropna().unique().tolist()))
+        if 'Marché' in df.columns:
+            filter_marche = st.selectbox("🏷️ Filtrer par Marché", options=["Tous", "🟢 En Cours", "🔴 Dépassé"])
         else:
-            filter_type = "Tous"
+            filter_marche = "Tous"
+
+        if 'is_new' in df.columns:
+            filter_is_new = st.selectbox("🔔 Filtrer par Nouveaux Appels d'Offres", options=["Tous", "🔔 Nouveaux", "🔕 Anciens"])
+        else:
+            filter_is_new = "Tous"
+
 
     # Application des filtres
     filtered_df = df.copy()
@@ -132,8 +136,11 @@ if "ao_data" in st.session_state:
     if filter_ville != "Toutes" and 'Ville' in filtered_df.columns:
         filtered_df = filtered_df[filtered_df['Ville'] == filter_ville]
 
-    if filter_type != "Tous" and 'Type d\'offre' in filtered_df.columns:
-        filtered_df = filtered_df[filtered_df['Type d\'offre'] == filter_type]
+    if filter_marche != "Tous" and 'Marché' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['Marché'] == filter_marche]
+
+    if filter_is_new != "Tous" and 'is_new' in filtered_df.columns:
+        filtered_df = filtered_df[filtered_df['is_new'] == (filter_is_new == "🔔 Nouveaux")]
 
     st.write(f"🔍 **{len(filtered_df)} appels d'offres trouvés après filtrage**")
 
@@ -153,9 +160,17 @@ if "ao_data" in st.session_state:
             return "background-color: #d4edda; color: #155724; font-weight: bold;"
         return ""
 
+    def color_new_ao(val):
+        if val == "🔔":
+            return "background-color: #fff3cd; color: #856404; font-weight: bold;"
+        elif val == "🔕":
+            return "background-color: #f8d7da; color: #721c24; font-weight: bold;"
+        return ""
+
     # Application des styles
-    styled_df = filtered_df.style.applymap(color_estimation, subset=['Caution', 'Estimation']) \
-                                 .applymap(color_market, subset=['Marché'])
+    styled_df = filtered_df.style.applymap(color_estimation, subset=['Estimation']) \
+                                 .applymap(color_market, subset=['Marché']) \
+                                 .applymap(color_new_ao, subset=['is_new'])
 
     st.dataframe(styled_df, use_container_width=True)
 
