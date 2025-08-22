@@ -1,84 +1,15 @@
-# db.py
-from __future__ import annotations
-
-import traceback
+import logging
+from db.database import engine
+from sqlalchemy import text
 from datetime import datetime
 import pandas as pd
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import IntegrityError
 import numpy as np
 
+from db.utils import ensure_tables, force_utf8, _to_datetime_series, COL_MAP, inverse_map
+from sqlalchemy.exc import IntegrityError
+import traceback
 
-# ----------------------------------------------------------------------
-# 1) Connexion
-# ----------------------------------------------------------------------
-DB_URL = "postgresql://postgres:your_password@localhost:5432/AppelOffre"
-engine = create_engine(DB_URL, future=True, pool_pre_ping=True)
-
-# ----------------------------------------------------------------------
-# 2) Mapping colonnes DataFrame -> Base
-# ----------------------------------------------------------------------
-COL_MAP = {
-    "Organisme": "organisme",
-    "Date de Poste": "date_poste",
-    "Type d'AO": "type_offre",
-    "Ville": "ville",
-    "Numéro d'ordre": "numero_ordre",
-    "Numéro AO": "numero_ao",
-    "Date Limite": "date_limite",
-    "Caution": "caution",
-    "Estimation": "estimation",
-    "Description": "description",
-    "Marché": "marche",
-}
-
-# ----------------------------------------------------------------------
-# 3) Création des tables si elles n'existent pas
-# ----------------------------------------------------------------------
-def ensure_tables():
-    with engine.begin() as conn:
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS appels_offres (
-            id BIGSERIAL PRIMARY KEY,
-            organisme     TEXT,
-            date_poste    TIMESTAMP,
-            type_offre    TEXT,
-            ville         TEXT,
-            numero_ordre  TEXT,
-            numero_ao     TEXT,
-            date_limite   TIMESTAMP,
-            caution       NUMERIC,
-            estimation    NUMERIC,
-            description   TEXT,
-            marche        TEXT,
-            UNIQUE (numero_ordre, date_poste)
-        );
-        """))
-
-        conn.execute(text("""
-        CREATE TABLE IF NOT EXISTS scraping_metadata (
-            id SERIAL PRIMARY KEY,
-            last_scraping TIMESTAMP NOT NULL
-        );
-        """))
-
-# ----------------------------------------------------------------------
-# 4) Utils
-# ----------------------------------------------------------------------
-def force_utf8(value):
-    if isinstance(value, str):
-        try:
-            return value.encode("latin-1", errors="ignore").decode("utf-8", errors="ignore")
-        except Exception:
-            return value
-    return value
-
-def _to_datetime_series(s: pd.Series, dayfirst: bool = True):
-    return pd.to_datetime(s, errors="coerce", dayfirst=dayfirst)
-
-# ----------------------------------------------------------------------
-# 5) Lecture / écriture de la date de dernier scraping
-# ----------------------------------------------------------------------
+# Lecture de la date de dernier scraping
 def get_last_scraping_date():
     with engine.connect() as conn:
         row = conn.execute(
@@ -86,6 +17,7 @@ def get_last_scraping_date():
         ).fetchone()
         return row[0] if row else None
 
+# Ecriture de la date de dernier scraping et du nombre de nouvelles AO
 def update_last_scraping_meta_data(num_new_ao: int):
     ts = datetime.now()
     with engine.begin() as conn:
@@ -94,9 +26,7 @@ def update_last_scraping_meta_data(num_new_ao: int):
             {"ts": ts, "num_new_ao": num_new_ao}
         )
 
-# ----------------------------------------------------------------------
 # 6) Save + marquage is_new (en mémoire uniquement)
-# ----------------------------------------------------------------------
 def save_and_mark_new(df: pd.DataFrame, table_name: str = "appels_offres") -> pd.DataFrame:
     """
     - Renomme les colonnes selon COL_MAP
@@ -130,14 +60,10 @@ def save_and_mark_new(df: pd.DataFrame, table_name: str = "appels_offres") -> pd
         df["marche"] = df["marche"].fillna("Non spécifié")
 
     # Calcul de is_new par rapport à la dernière date de scraping
-    last_scraping_date = get_last_scraping_date()
-    if last_scraping_date is None:
-        df["is_new"] = True
-    else:
-        df["is_new"] = df["date_poste"] > last_scraping_date
+    df = calculate_is_new(df)
 
     df = df.replace({pd.NaT: None, np.nan: None})
-    # SQL d'insertion (sans RETURNING is_new)
+    
     insert_sql = f"""
         INSERT INTO {table_name} (
             organisme, date_poste, type_offre, ville, numero_ordre,
@@ -172,7 +98,22 @@ def save_and_mark_new(df: pd.DataFrame, table_name: str = "appels_offres") -> pd
         print("\n⛔ IntegrityError:", e)
         print(traceback.format_exc())
 
-    inverse_map = {v: k for k, v in COL_MAP.items()}
     df = df.rename(columns=inverse_map)
 
+    return df
+
+def load_last_scraping_results() -> pd.DataFrame:
+    with engine.connect() as conn:
+        df = pd.read_sql_table("appels_offres", conn)
+        df = calculate_is_new(df)
+        df = df.rename(columns=inverse_map)
+        return df
+
+def calculate_is_new(df: pd.DataFrame) -> pd.DataFrame:
+    last_scraping_date = get_last_scraping_date()
+    if last_scraping_date is None:
+        df["is_new"] = True
+        logging.info("Aucune date de dernier scraping trouvée. Tous les AO sont marqués comme nouveaux.")
+    else:
+        df["is_new"] = df["date_poste"] > last_scraping_date
     return df
